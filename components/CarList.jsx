@@ -20,7 +20,9 @@ export default function CarList({ cars, actionFor }) {
               {car.brand && <span className={styles.brand}>{car.brand}</span>}
               <span className={styles.name}>{car.name}</span>
               <span className={styles.stats}>
-                {toKmh(car.maxSpeed)} km/h top · 0–100 in {zeroToHundred(car).toFixed(1)} s
+                {car.kind === 'helicopter'
+                  ? toKmh(car.maxSpeed) + ' km/h top · ' + car.maxAltitude + ' m ceiling'
+                  : toKmh(car.maxSpeed) + ' km/h top · 0–100 in ' + zeroToHundred(car).toFixed(1) + ' s'}
               </span>
             </div>
             <button

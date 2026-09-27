@@ -15,6 +15,7 @@ import LightControl from './LightControl';
 import GarageButton from './GarageButton';
 import DevCashButton from './DevCashButton';
 import GaragePanel from './GaragePanel';
+import PhonePanel from './PhonePanel';
 import DealershipPanel from './DealershipPanel';
 import DealershipMarker from './DealershipMarker';
 import { useEconomy } from '@/hooks/useEconomy';
@@ -66,11 +67,14 @@ export default function BuildingMap() {
   const garage = useGarage();
   const dealership = useDealership(driveMode);
   const [garageOpen, setGarageOpen] = useState(false);
+  const [phoneOpen, setPhoneOpen] = useState(false);
   const setDealershipOpen = dealership.setOpen;
   // Whether the player is on foot (play mode only), and the latest
-  // "park this car on the dealership lot" request for CarDriving.
+  // "park this car on the dealership lot" / "summon this car to me" requests
+  // for CarDriving.
   const [onFoot, setOnFoot] = useState(true);
   const [lotRequest, setLotRequest] = useState(null);
+  const [summonRequest, setSummonRequest] = useState(null);
   // Where each owned car is in the world ({carId, lng, lat, inUse}), and the
   // player's last position — for the garage list. Seeded from the save.
   const [fleet, setFleet] = useState(initialFleet);
@@ -86,9 +90,15 @@ export default function BuildingMap() {
     if (!driveMode) {
       setOnFoot(true);
       setHudHidden(false);
+      setPhoneOpen(false);
       syncCash(); // show the last second of earnings
     }
   }, [driveMode, syncCash]);
+
+  // The phone only makes sense on foot — close it the moment a car is entered.
+  useEffect(() => {
+    if (!onFoot) setPhoneOpen(false);
+  }, [onFoot]);
 
   useEffect(() => {
     if (!driveMode) return undefined;
@@ -102,9 +112,12 @@ export default function BuildingMap() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [driveMode]);
 
-  // Only one menu at a time: arriving at the dealership closes the garage.
+  // Only one menu at a time: arriving at the dealership closes the garage/phone.
   useEffect(() => {
-    if (dealership.open) setGarageOpen(false);
+    if (dealership.open) {
+      setGarageOpen(false);
+      setPhoneOpen(false);
+    }
   }, [dealership.open]);
 
   // Load a saved token (or the optional build-time default) once, on mount.
@@ -147,11 +160,29 @@ export default function BuildingMap() {
       const el = e.target;
       if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
       setDealershipOpen(false);
+      setPhoneOpen(false);
       setGarageOpen((open) => !open);
     }
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [mapReady, setDealershipOpen]);
+
+  // "Tab" toggles the phone (summon an owned car) while playing, on foot.
+  useEffect(() => {
+    if (!driveMode) return undefined;
+    function handleKeyDown(e) {
+      if (e.code !== 'Tab' || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+      const el = e.target;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+      if (!onFoot) return;
+      e.preventDefault();
+      setDealershipOpen(false);
+      setGarageOpen(false);
+      setPhoneOpen((open) => !open);
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [driveMode, onFoot, setDealershipOpen]);
 
   // Create (and tear down) the Mapbox map whenever we have a token to try.
   useEffect(() => {
@@ -273,6 +304,12 @@ export default function BuildingMap() {
     setDealershipOpen(false);
   }
 
+  // Phone: summon an owned car to the player's current location.
+  function handleSummonCar(id) {
+    setSummonRequest({ id });
+    setPhoneOpen(false);
+  }
+
   function handlePose(pose) {
     playerPosRef.current = pose;
     dealership.onPose(pose);
@@ -324,8 +361,9 @@ export default function BuildingMap() {
               }}
               onFleetChange={setFleet}
               lotRequest={lotRequest}
+              summonRequest={summonRequest}
               lightPreset={light.preset}
-              paused={dealership.open || garageOpen}
+              paused={dealership.open || garageOpen || phoneOpen}
               hudHidden={hudHidden}
             />
           )}
@@ -346,6 +384,9 @@ export default function BuildingMap() {
               playerPos={playerPosRef.current || null}
               onClose={() => setGarageOpen(false)}
             />
+          )}
+          {phoneOpen && (
+            <PhonePanel owned={garage.owned} onSummon={handleSummonCar} onClose={() => setPhoneOpen(false)} />
           )}
         </>
       )}

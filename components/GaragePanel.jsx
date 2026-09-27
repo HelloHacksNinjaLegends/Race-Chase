@@ -3,8 +3,9 @@ import CarList from './CarList';
 import { CARS } from '@/lib/carCatalog';
 import { distanceMeters } from '@/lib/buildingCollision';
 
-// Read-only list of owned cars and where they are. Cars can't be summoned;
-// walk to them, or move one to the dealership lot from the dealership.
+// Read-only list of owned cars and where they are. To bring one to you, use
+// the phone (Tab) while on foot, or move one to the dealership lot from the
+// dealership.
 export default function GaragePanel({ owned, fleet, playerPos, onClose }) {
   const cars = CARS.filter((c) => owned.includes(c.id));
 

@@ -12,7 +12,7 @@
 // playerState.js (on foot ↔ driving state machine), vehicle.js (car
 // physics), vehicleRig.js + carModel.js (car models), character.js
 // (walking), blobCharacterModel.js, traffic.js (NPC cars on OSM roads, with
-// mapboxRoads.js as a fallback), followCamera.js, dealership.js,
+// mapboxRoads.js as a fallback), orbitCamera.js, dealership.js,
 // worldLayer.js (rendering), buildingCollision.js, and worldSave.js (parked
 // cars + player position survive sessions/reloads).
 
@@ -32,9 +32,15 @@ import { createVehicle, stepVehicle, pointInVehicle } from '@/lib/vehicle';
 import { createCharacter, stepCharacter } from '@/lib/character';
 import { createTraffic } from '@/lib/traffic';
 import { buildRoadGraphFromMap } from '@/lib/mapboxRoads';
+import { createPhysicsWorld } from '@/lib/physicsWorld';
+import { createTrees } from '@/lib/trees';
+import { createBuildingPhysics } from '@/lib/buildingPhysics';
+import { createHelicopter, stepHelicopter, removeHelicopter, teleportHelicopter } from '@/lib/helicopterVehicle';
+import { setHelicopterModel, spinRotors } from '@/lib/helicopterModel';
+import { createStreetlights } from '@/lib/streetlights';
+import { setStreetlightLevel } from '@/lib/streetlightModel';
 import { loadWorld, saveWorld } from '@/lib/worldSave';
-import { createFollowCamera, cameraProfile, CAMERA_MAX_ZOOM } from '@/lib/followCamera';
-import { loadCameraView, saveCameraView, nextCameraView } from '@/lib/cameraView';
+import { createOrbitCamera } from '@/lib/orbitCamera';
 import {
   MAP_PITCH,
   DRIVE_START,
@@ -42,7 +48,16 @@ import {
   CAR_WIDTH,
   WALK_SPEED,
   CHARACTER_RADIUS,
-  ENTER_CAR_RANGE_M
+  ENTER_CAR_RANGE_M,
+  CAMERA_MAX_ZOOM,
+  ORBIT_MIN_PITCH_DEG,
+  ORBIT_MAX_PITCH_DEG,
+  ORBIT_YAW_SENSITIVITY,
+  ORBIT_PITCH_SENSITIVITY,
+  ORBIT_ZOOM_SENSITIVITY,
+  WALK_ORBIT_CAMERA,
+  DRIVE_ORBIT_CAMERA,
+  FLY_ORBIT_CAMERA
 } from '@/lib/constants';
 
 const WORLD_LAYER_ID = 'drive-world';
@@ -76,7 +91,8 @@ const KEY_BINDINGS = {
   KeyD: 'right',
   ArrowRight: 'right',
   ShiftLeft: 'run',
-  ShiftRight: 'run'
+  ShiftRight: 'run',
+  Space: 'ascend'
 };
 
 /**
@@ -85,6 +101,8 @@ const KEY_BINDINGS = {
  * @param {string}   props.lightPreset  Current Mapbox Standard light preset (dawn/day/dusk/night).
  * @param {{id: string}} props.lotRequest  A new object each time a car should be parked on the
  *                                         dealership lot (bought, or moved there).
+ * @param {{id: string}} props.summonRequest  A new object each time the phone summons an owned
+ *                                             car to the player's current location.
  * @param {function} props.onExit       Leave play mode.
  * @param {function} props.onDistance   Called with meters driven, every frame the car moves (not on foot).
  * @param {function} props.onPose       Called with the player's {lng, lat, heading} ~10×/s.
@@ -95,6 +113,7 @@ const KEY_BINDINGS = {
 export default function CarDriving({
   map,
   lotRequest,
+  summonRequest,
   paused,
   hudHidden,
   onExit,
@@ -114,11 +133,11 @@ export default function CarDriving({
 
   const [hud, setHud] = useState({
     speedKmh: 0,
+    altitudeM: null,
     blocked: false,
     onFoot: true,
     interact: null,
-    trafficLoading: false,
-    view: 'chase'
+    trafficLoading: false
   });
 
   const onExitRef = useRef(onExit);
@@ -146,13 +165,38 @@ export default function CarDriving({
     const npcs = new Set(); // live NPC traffic, for wheel spin
     const collider = createBuildingCollider(map);
 
+    // --- Physics (trees, and later helicopters): a shared cannon-es world,
+    // anchored at the fixed start point. Car-vs-building/NPC collision stays
+    // on the point-probe system above; see lib/physicsWorld.js for why.
+    const physics = createPhysicsWorld(DRIVE_START[0], DRIVE_START[1]);
+    collider.update(DRIVE_START[0], DRIVE_START[1], performance.now());
+    const trees = createTrees({
+      physics,
+      sceneWorld: world,
+      centerLng: DRIVE_START[0],
+      centerLat: DRIVE_START[1],
+      isBlocked: (lng, lat) => collider.contains(lng, lat),
+      repaint
+    });
+    // Building box colliders for the helicopter only (see lib/buildingPhysics.js).
+    const buildingPhysics = createBuildingPhysics({ physics, collider });
+
+    // --- Streetlights: placed once, as soon as traffic's road graph loads ---
+    let streetlights = null;
+
     // --- Owned cars in the world. Each: { def, state, object, handle } ---
     const vehicles = [];
 
     function spawnVehicle(def, lng, lat, heading) {
       const object = new THREE.Group();
-      setCarModel(object, def, repaint);
-      const state = createVehicle(lng, lat, heading);
+      let state;
+      if (def.kind === 'helicopter') {
+        setHelicopterModel(object, def);
+        state = createHelicopter(physics, lng, lat, heading);
+      } else {
+        setCarModel(object, def, repaint);
+        state = createVehicle(lng, lat, heading);
+      }
       const vehicle = { def, state, object, handle: world.add(object, state) };
       vehicles.push(vehicle);
       return vehicle;
@@ -160,9 +204,23 @@ export default function CarDriving({
 
     function despawnVehicle(vehicle) {
       world.remove(vehicle.handle);
-      cancelCarModel(vehicle.object);
+      if (vehicle.def.kind === 'helicopter') {
+        removeHelicopter(vehicle.state);
+      } else {
+        cancelCarModel(vehicle.object);
+      }
       disposeObject(vehicle.object);
       vehicles.splice(vehicles.indexOf(vehicle), 1);
+    }
+
+    // Moves a parked (not driven) vehicle to lng/lat/heading — used by the
+    // dealership lot and the phone summon, for both cars and helicopters.
+    function repositionVehicle(vehicle, lng, lat, heading) {
+      if (vehicle.def.kind === 'helicopter') {
+        teleportHelicopter(vehicle.state, lng, lat, heading);
+      } else {
+        Object.assign(vehicle.state, { lng, lat, heading, speed: 0, steer: 0 });
+      }
     }
 
     // --- The player: always starts on foot (state machine: lib/playerState.js) ---
@@ -251,11 +309,15 @@ export default function CarDriving({
       return (lng, lat) =>
         collider.contains(lng, lat) ||
         traffic.blocks(lng, lat) ||
+        trees.blocksAt(lng, lat) ||
         vehicles.some((v) => v !== self && pointInVehicle(v.state, lng, lat));
     }
     function blocksWalker(lng, lat) {
       return (
-        collider.contains(lng, lat) || traffic.blocks(lng, lat) || vehicles.some((v) => pointInVehicle(v.state, lng, lat))
+        collider.contains(lng, lat) ||
+        traffic.blocks(lng, lat) ||
+        trees.blocksAt(lng, lat) ||
+        vehicles.some((v) => pointInVehicle(v.state, lng, lat))
       );
     }
     // What NPC cars stop for: the player's cars and the character.
@@ -286,6 +348,8 @@ export default function CarDriving({
       let best = null;
       let bestDistance = Infinity;
       for (const v of vehicles) {
+        // Can't board a helicopter mid-flight — only once it's landed.
+        if (v.def.kind === 'helicopter' && v.state.altitude > 1) continue;
         if (!pointInVehicle(v.state, character.lng, character.lat, ENTER_CAR_RANGE_M)) continue;
         const d = distanceMeters(character.lng, character.lat, v.state.lng, v.state.lat);
         if (d < bestDistance) {
@@ -344,12 +408,41 @@ export default function CarDriving({
       }
       slot = slot || lotSlot(0);
       if (existing) {
-        Object.assign(existing.state, { lng: slot.lng, lat: slot.lat, heading: slot.heading, speed: 0, steer: 0 });
+        repositionVehicle(existing, slot.lng, slot.lat, slot.heading);
       } else {
         spawnVehicle(def, slot.lng, slot.lat, slot.heading);
       }
       reportFleet();
       map.triggerRepaint();
+    }
+
+    // Phone: summon `def` to wherever the player is standing, parking any
+    // other owned car that's currently out so we don't litter the map with
+    // duplicates. Only meaningful on foot (the phone UI is closed otherwise).
+    function summonCar(def) {
+      if (state !== ON_FOOT) return;
+      for (const v of vehicles.slice()) {
+        if (v.def.id !== def.id) deliverToLot(v.def);
+      }
+      const spot = summonSpot(character.lng, character.lat, character.heading);
+      const existing = vehicles.find((v) => v.def.id === def.id);
+      if (existing) {
+        repositionVehicle(existing, spot.lng, spot.lat, spot.heading);
+      } else {
+        spawnVehicle(def, spot.lng, spot.lat, spot.heading);
+      }
+      reportFleet();
+      map.triggerRepaint();
+    }
+
+    // A clear-ish spot just ahead of the character (or behind, if that's
+    // blocked) to park a freshly summoned car.
+    function summonSpot(lng, lat, heading) {
+      const distance = CAR_WIDTH + 2;
+      const front = offsetLngLat(lng, lat, heading, distance);
+      if (!collider.contains(front[0], front[1])) return { lng: front[0], lat: front[1], heading };
+      const back = offsetLngLat(lng, lat, heading + 180, distance);
+      return { lng: back[0], lat: back[1], heading: heading + 180 };
     }
 
     // Where each owned car is, for the garage list.
@@ -399,29 +492,59 @@ export default function CarDriving({
       const lighting = SCENE_LIGHTING[preset] || SCENE_LIGHTING.day;
       world.setLighting(lighting);
       setLampLevel(lighting.lamps);
+      setStreetlightLevel(lighting.lamps);
     }
 
-    sessionRef.current = { deliverToLot, setLighting };
-
-    // --- Camera view: 'chase' (third person) or 'pov' (first person), cycled with C ---
-    let cameraView = loadCameraView();
+    sessionRef.current = { deliverToLot, setLighting, summonCar };
 
     // --- Keyboard input ---
-    const pressed = { up: false, down: false, left: false, right: false, run: false };
+    const pressed = { up: false, down: false, left: false, right: false, run: false, ascend: false };
+
+    // 'walk' | 'drive' | 'fly' — which orbit-camera config applies right now.
+    function playerMode() {
+      if (!driven) return 'walk';
+      return driven.def.kind === 'helicopter' ? 'fly' : 'drive';
+    }
+    function configFor(mode) {
+      return mode === 'walk' ? WALK_ORBIT_CAMERA : mode === 'fly' ? FLY_ORBIT_CAMERA : DRIVE_ORBIT_CAMERA;
+    }
+
+    // On foot, WASD is relative to the camera (GTA-style): "up" walks away
+    // from the camera, "right" strafes clockwise from it, etc. — not the
+    // character's own heading. Returns a compass heading, or null if nothing's pressed.
+    function moveHeadingFromCamera() {
+      const yawRad = (camera.yaw * Math.PI) / 180;
+      const fwdX = Math.sin(yawRad);
+      const fwdY = Math.cos(yawRad);
+      const rightX = Math.sin(yawRad + Math.PI / 2);
+      const rightY = Math.cos(yawRad + Math.PI / 2);
+      let ex = 0;
+      let ey = 0;
+      if (pressed.up) {
+        ex += fwdX;
+        ey += fwdY;
+      }
+      if (pressed.down) {
+        ex -= fwdX;
+        ey -= fwdY;
+      }
+      if (pressed.right) {
+        ex += rightX;
+        ey += rightY;
+      }
+      if (pressed.left) {
+        ex -= rightX;
+        ey -= rightY;
+      }
+      if (ex === 0 && ey === 0) return null;
+      return (Math.atan2(ex, ey) * 180) / Math.PI;
+    }
 
     function handleKey(e) {
       if (isTypingTarget(e.target)) return;
       const isDown = e.type === 'keydown';
       if (isDown && e.code === 'Escape' && !pausedRef.current) {
         onExitRef.current();
-        return;
-      }
-      if (isDown && e.code === 'KeyC') {
-        e.preventDefault();
-        if (e.repeat) return;
-        cameraView = nextCameraView(cameraView);
-        saveCameraView(cameraView);
-        lastHudUpdate = 0; // show the new view in the HUD right away
         return;
       }
       if (isDown && e.code === 'KeyE') {
@@ -446,10 +569,40 @@ export default function CarDriving({
     window.addEventListener('keyup', handleKey);
     window.addEventListener('blur', releaseAll);
 
+    // --- Mouse: drag to orbit the camera, scroll to zoom (no auto-snap-back) ---
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
+    function handlePointerDown(e) {
+      if (pausedRef.current || e.button !== 0) return;
+      dragging = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+    }
+    function handlePointerMove(e) {
+      if (!dragging) return;
+      camera.orbit(e.clientX - lastX, e.clientY - lastY, ORBIT_YAW_SENSITIVITY, ORBIT_PITCH_SENSITIVITY);
+      lastX = e.clientX;
+      lastY = e.clientY;
+    }
+    function handlePointerUp() {
+      dragging = false;
+    }
+    function handleWheel(e) {
+      if (pausedRef.current) return;
+      e.preventDefault();
+      camera.zoom(e.deltaY, ORBIT_ZOOM_SENSITIVITY);
+    }
+    const canvas = map.getCanvas();
+    canvas.addEventListener('pointerdown', handlePointerDown);
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+
     // --- Take over the camera ---
     const disabledHandlers = USER_HANDLERS.filter((name) => map[name] && map[name].isEnabled());
     disabledHandlers.forEach((name) => map[name].disable());
-    // Eye-level POV needs zooms past Mapbox's default limit of 22.
+    // The orbit camera can zoom in past Mapbox's default zoom limit of 22.
     const previousMaxZoom = map.getMaxZoom();
     activeSessions++;
     map.setMaxZoom(CAMERA_MAX_ZOOM);
@@ -459,7 +612,8 @@ export default function CarDriving({
 
     // Ease from wherever the user was into the follow view before handing
     // control to the per-frame camera.
-    const camera = createFollowCamera(map, player(), cameraProfile(!driven, cameraView));
+    let cameraMode = playerMode();
+    const camera = createOrbitCamera(map, player(), configFor(cameraMode), ORBIT_MIN_PITCH_DEG, ORBIT_MAX_PITCH_DEG);
     map.easeTo({ ...camera.introOptions(), duration: INTRO_DURATION_MS });
     const introEndsAt = performance.now() + INTRO_DURATION_MS;
 
@@ -490,21 +644,38 @@ export default function CarDriving({
       const turn = isPaused ? 0 : (pressed.right ? 1 : 0) - (pressed.left ? 1 : 0);
 
       let result;
-      if (driven) {
+      if (driven && driven.def.kind === 'helicopter') {
+        const lift = isPaused ? 0 : (pressed.ascend ? 1 : 0) - (pressed.run ? 1 : 0);
+        result = stepHelicopter(driven.state, { throttle: forward, steer: turn, lift }, driven.def, dt);
+        spinRotors(driven.object, dt);
+        if (result.distance > 0 && onDistanceRef.current) onDistanceRef.current(result.distance);
+      } else if (driven) {
         result = stepVehicle(driven.state, { throttle: forward, steer: turn, brake: isPaused }, driven.def, dt, blocksCar(driven));
         if (result.distance > 0) {
           spinWheels(driven.object, Math.sign(driven.state.speed) * result.distance);
           if (onDistanceRef.current) onDistanceRef.current(result.distance);
         }
+        trees.checkImpact(driven.state.lng, driven.state.lat, driven.state.heading, driven.state.speed);
       } else {
-        result = stepCharacter(character, { forward, turn, run: pressed.run }, dt, blocksWalker);
+        const moveHeading = isPaused ? null : moveHeadingFromCamera();
+        result = stepCharacter(
+          character,
+          { moving: moveHeading !== null, moveHeading: moveHeading || 0, run: pressed.run },
+          dt,
+          blocksWalker
+        );
         poseBlobCharacter(characterObject, character.walkPhase, Math.min(Math.abs(character.speed) / WALK_SPEED, 1));
       }
       if (result.blocked) blockedUntil = now + 700;
 
+      buildingPhysics.sync();
+      physics.step(dt);
+      trees.sync();
+
       updateView();
       traffic.update(dt, me, now, blocksTraffic);
       for (const npc of npcs) spinWheels(npc.object, npc.moved);
+      if (!streetlights && traffic.graph) streetlights = createStreetlights(world, traffic.graph);
 
       if (now - lastSave > SAVE_INTERVAL_MS) {
         lastSave = now;
@@ -512,9 +683,12 @@ export default function CarDriving({
         reportFleet();
       }
 
-      camera.update(me, cameraProfile(!driven, cameraView), dt);
-      // In first person on foot, the camera is inside the character's head.
-      characterObject.visible = !!driven || cameraView !== 'pov';
+      const mode = playerMode();
+      if (mode !== cameraMode) {
+        cameraMode = mode;
+        camera.setConfig(configFor(mode));
+      }
+      camera.update(me);
       map.triggerRepaint();
 
       // HUD + pose reports are throttled so React isn't re-rendering at 60 fps.
@@ -523,12 +697,12 @@ export default function CarDriving({
         if (onPoseRef.current) onPoseRef.current({ lng: me.lng, lat: me.lat, heading: me.heading });
         const next = {
           speedKmh: Math.round(Math.abs(me.speed) * 3.6),
+          altitudeM: driven && driven.def.kind === 'helicopter' ? Math.round(me.altitude) : null,
           blocked: now < blockedUntil,
           onFoot: state === ON_FOOT,
           interact: interactPrompt(interactContext()),
           trafficLoading:
-            traffic.status.source === 'loading' && now - trafficStartedAt > TRAFFIC_LOADING_HINT_AFTER_MS,
-          view: cameraView
+            traffic.status.source === 'loading' && now - trafficStartedAt > TRAFFIC_LOADING_HINT_AFTER_MS
         };
         if (!lastHud || Object.keys(next).some((k) => next[k] !== lastHud[k])) {
           lastHud = next;
@@ -546,6 +720,10 @@ export default function CarDriving({
       window.removeEventListener('keydown', handleKey);
       window.removeEventListener('keyup', handleKey);
       window.removeEventListener('blur', releaseAll);
+      canvas.removeEventListener('pointerdown', handlePointerDown);
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      canvas.removeEventListener('wheel', handleWheel);
 
       const me = player();
       // The map may already be gone if BuildingMap is tearing it down too.
@@ -565,6 +743,10 @@ export default function CarDriving({
       vehicles.slice().forEach(despawnVehicle);
       traffic.dispose();
       collider.dispose();
+      trees.dispose();
+      buildingPhysics.dispose();
+      physics.dispose();
+      if (streetlights) streetlights.dispose();
       disposeObject(characterObject);
     };
   }, [map]);
@@ -577,6 +759,11 @@ export default function CarDriving({
   useEffect(() => {
     if (lotRequest && sessionRef.current) sessionRef.current.deliverToLot(getCar(lotRequest.id));
   }, [lotRequest]);
+
+  // The phone: summon an owned car to wherever the player is standing.
+  useEffect(() => {
+    if (summonRequest && sessionRef.current) sessionRef.current.summonCar(getCar(summonRequest.id));
+  }, [summonRequest]);
 
   const onModeChangeRef = useRef(onModeChange);
   onModeChangeRef.current = onModeChange;
@@ -598,7 +785,7 @@ export default function CarDriving({
   return (
     <GameHud
       speedKmh={hud.speedKmh}
-      view={hud.view}
+      altitudeM={hud.altitudeM}
       onFoot={hud.onFoot}
       timeOfDay={lightPreset}
       prompt={prompt}
