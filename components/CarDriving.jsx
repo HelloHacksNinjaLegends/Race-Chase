@@ -25,7 +25,7 @@ import { setCarModel, cancelCarModel, spinWheels, setLampLevel, disposeObject } 
 import { SCENE_LIGHTING } from '@/lib/sceneLighting';
 import { buildBlobCharacter, poseBlobCharacter } from '@/lib/blobCharacterModel';
 import { ON_FOOT, DRIVING, resolveInteract, interactPrompt, nextState } from '@/lib/playerState';
-import { lotSlot, LOT_SLOT_COUNT, isAtDealership } from '@/lib/dealership';
+import { lotSlot, LOT_SLOT_COUNT } from '@/lib/dealership';
 import { createWorldLayer } from '@/lib/worldLayer';
 import { createBuildingCollider, offsetLngLat, distanceMeters, localOffsetMeters } from '@/lib/buildingCollision';
 import { createVehicle, stepVehicle, pointInVehicle } from '@/lib/vehicle';
@@ -91,6 +91,7 @@ const KEY_BINDINGS = {
  * @param {function} props.onModeChange Called with true/false when the player gets out of / into a car.
  * @param {function} props.onOpenDealership  E pressed at the dealership.
  * @param {function} props.onFleetChange     Called with [{carId, lng, lat, inUse}] when owned cars move.
+ * @param {{start: object, destination: object, route: object, mode: string, carId?: string, simulate: boolean}|null} props.navigation Active route guidance.
  */
 export default function CarDriving({
   map,
@@ -103,7 +104,10 @@ export default function CarDriving({
   onModeChange,
   onOpenDealership,
   onFleetChange,
-  lightPreset
+  lightPreset,
+  navigation,
+  walkingSpeed,
+  simulationSpeed
 }) {
   // The controls hint shows for the first few seconds of a drive, then fades.
   const [showControls, setShowControls] = useState(true);
@@ -135,6 +139,13 @@ export default function CarDriving({
   pausedRef.current = paused;
   const lightPresetRef = useRef(lightPreset);
   lightPresetRef.current = lightPreset;
+  const navigationRef = useRef(navigation);
+  navigationRef.current = navigation;
+  const walkingSpeedRef = useRef(walkingSpeed);
+  walkingSpeedRef.current = walkingSpeed;
+  const simulationSpeedRef = useRef(simulationSpeed);
+  simulationSpeedRef.current = simulationSpeed;
+  const simulationRef = useRef({ route: null, index: 0 });
   // Set by the main effect; lets later effects reach the running session.
   const sessionRef = useRef(null);
 
@@ -301,7 +312,7 @@ export default function CarDriving({
       return {
         state,
         nearestCar: car ? { id: car.def.id, name: carDisplayName(car.def), vehicle: car } : null,
-        atDealership: state === ON_FOOT && isAtDealership(character.lng, character.lat)
+        atDealership: false
       };
     }
 
@@ -367,6 +378,48 @@ export default function CarDriving({
       if (onFleetChangeRef.current) onFleetChangeRef.current(fleet);
     }
 
+    let lastNavigationId = null;
+    function beginNavigation(nav) {
+      if (!nav?.start || nav.id === lastNavigationId) return;
+      lastNavigationId = nav.id;
+      simulationRef.current = { route: null, index: 0 };
+      const coordinates = nav.route?.geometry?.coordinates || [];
+      const heading = routeHeading(coordinates, nav.start.heading ?? map.getBearing());
+
+      if (nav.mode === 'driving' && nav.carId) {
+        if (driven) {
+          driven.state.speed = 0;
+          driven.state.steer = 0;
+        }
+        if (characterHandle) {
+          world.remove(characterHandle);
+          characterHandle = null;
+        }
+        driven = vehicles.find((vehicle) => vehicle.def.id === nav.carId)
+          || spawnVehicle(getCar(nav.carId), nav.start.lng, nav.start.lat, heading);
+        Object.assign(driven.state, {
+          lng: nav.start.lng,
+          lat: nav.start.lat,
+          heading,
+          speed: 0,
+          steer: 0
+        });
+        state = DRIVING;
+      } else {
+        if (driven) {
+          driven.state.speed = 0;
+          driven.state.steer = 0;
+        }
+        driven = null;
+        state = ON_FOOT;
+        placeCharacter(nav.start.lng, nav.start.lat, heading);
+      }
+
+      if (sessionRef.current) releaseAll();
+      reportFleet();
+      map.triggerRepaint();
+    }
+
     // Starting position (see the note at the top of this section).
     if (resume && resume.mode === 'driving') {
       const car = vehicles.find((v) => v.def.id === resume.carId);
@@ -378,6 +431,7 @@ export default function CarDriving({
       const [lng, lat] = zoomedIn ? [center.lng, center.lat] : DRIVE_START;
       placeCharacter(lng, lat, map.getBearing());
     }
+    beginNavigation(navigationRef.current);
     reportFleet();
 
     // --- Saving the world ---    // --- Saving the world ---
@@ -401,7 +455,7 @@ export default function CarDriving({
       setLampLevel(lighting.lamps);
     }
 
-    sessionRef.current = { deliverToLot, setLighting };
+    sessionRef.current = { deliverToLot, setLighting, beginNavigation };
 
     // --- Camera view: 'chase' (third person) or 'pov' (first person), cycled with C ---
     let cameraView = loadCameraView();
@@ -491,13 +545,37 @@ export default function CarDriving({
 
       let result;
       if (driven) {
-        result = stepVehicle(driven.state, { throttle: forward, steer: turn, brake: isPaused }, driven.def, dt, blocksCar(driven));
+        const nav = navigationRef.current;
+        if (nav?.simulate && nav.route?.geometry?.coordinates?.length > 1) {
+          result = stepRouteSimulation(
+            driven.state,
+            nav.route.geometry.coordinates,
+            dt,
+            simulationRef.current,
+            blocksCar(driven),
+            Math.min(driven.def.maxSpeed, driven.def.maxSpeed * 0.55 * simulationSpeedRef.current)
+          );
+        } else {
+          result = stepVehicle(driven.state, { throttle: forward, steer: turn, brake: isPaused }, driven.def, dt, blocksCar(driven));
+        }
         if (result.distance > 0) {
           spinWheels(driven.object, Math.sign(driven.state.speed) * result.distance);
           if (onDistanceRef.current) onDistanceRef.current(result.distance);
         }
       } else {
-        result = stepCharacter(character, { forward, turn, run: pressed.run }, dt, blocksWalker);
+        const nav = navigationRef.current;
+        if (nav?.simulate && nav.route?.geometry?.coordinates?.length > 1) {
+          result = stepRouteSimulation(
+            character,
+            nav.route.geometry.coordinates,
+            dt,
+            simulationRef.current,
+            blocksWalker,
+            WALK_SPEED * 1.45 * simulationSpeedRef.current
+          );
+        } else {
+          result = stepCharacter(character, { forward, turn, run: pressed.run }, dt, blocksWalker, walkingSpeedRef.current);
+        }
         poseBlobCharacter(characterObject, character.walkPhase, Math.min(Math.abs(character.speed) / WALK_SPEED, 1));
       }
       if (result.blocked) blockedUntil = now + 700;
@@ -573,6 +651,10 @@ export default function CarDriving({
     if (sessionRef.current) sessionRef.current.setLighting(lightPreset);
   }, [lightPreset]);
 
+  useEffect(() => {
+    if (navigation && sessionRef.current) sessionRef.current.beginNavigation(navigation);
+  }, [navigation]);
+
   // A car bought or moved at the dealership: park it on the lot.
   useEffect(() => {
     if (lotRequest && sessionRef.current) sessionRef.current.deliverToLot(getCar(lotRequest.id));
@@ -606,6 +688,71 @@ export default function CarDriving({
       showControls={showControls}
     />
   );
+}
+
+// Move the on-foot character along a returned route for the preview's
+// simulation mode. The normal keyboard movement remains untouched for Walk it.
+function stepRouteSimulation(character, coordinates, dt, progress, blocksWalker, speedMetersPerSecond) {
+  if (progress.route !== coordinates) {
+    progress.route = coordinates;
+    progress.index = nearestRouteIndex(character, coordinates);
+  }
+  let remaining = speedMetersPerSecond * dt;
+  let blocked = false;
+  let moved = 0;
+  while (remaining > 0 && progress.index < coordinates.length - 1) {
+    const target = coordinates[progress.index + 1];
+    const dx = target[0] - character.lng;
+    const dy = target[1] - character.lat;
+    const distance = Math.hypot(dx * 111320 * Math.cos((character.lat * Math.PI) / 180), dy * 111320);
+    if (distance < 0.75) {
+      progress.index += 1;
+      continue;
+    }
+    const travel = Math.min(remaining, distance);
+    const ratio = travel / distance;
+    const nextLng = character.lng + dx * ratio;
+    const nextLat = character.lat + dy * ratio;
+    if (blocksWalker(nextLng, nextLat)) {
+      blocked = true;
+      break;
+    }
+    character.heading = (Math.atan2(dx, dy) * 180) / Math.PI;
+    character.lng = nextLng;
+    character.lat = nextLat;
+    character.speed = speedMetersPerSecond;
+    if (Number.isFinite(character.walkPhase)) character.walkPhase += travel * 5;
+    moved += travel;
+    remaining -= travel;
+  }
+  if (progress.index >= coordinates.length - 1) character.speed = 0;
+  return { blocked, distance: moved };
+}
+
+function routeHeading(coordinates, fallback) {
+  if (coordinates.length < 2) return fallback;
+  const [fromLng, fromLat] = coordinates[0];
+  const [toLng, toLat] = coordinates[1];
+  const east = (toLng - fromLng) * Math.cos((fromLat * Math.PI) / 180);
+  const north = toLat - fromLat;
+  return (Math.atan2(east, north) * 180) / Math.PI;
+}
+
+function nearestRouteIndex(character, coordinates) {
+  let nearest = 0;
+  let best = Infinity;
+  for (let i = 0; i < coordinates.length; i++) {
+    const point = coordinates[i];
+    const distance = Math.hypot(
+      (point[0] - character.lng) * 111320 * Math.cos((character.lat * Math.PI) / 180),
+      (point[1] - character.lat) * 111320
+    );
+    if (distance < best) {
+      best = distance;
+      nearest = i;
+    }
+  }
+  return nearest;
 }
 
 // Drive sessions currently mounted; the zoom limit is only restored when none are.

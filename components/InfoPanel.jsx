@@ -3,7 +3,7 @@ import styles from './InfoPanel.module.css';
 /**
  * Slide-in panel showing details for the currently selected building.
  * `building` is null when nothing is selected, or
- * { title, height, minHeight, type, coords } (all pre-formatted strings).
+ * { title, name, address, height, minHeight, type, coords } (pre-formatted strings).
  */
 export default function InfoPanel({ building, onClose }) {
   const open = Boolean(building);
@@ -19,6 +19,18 @@ export default function InfoPanel({ building, onClose }) {
       </button>
       <p className={styles.eyebrow}>Selected building</p>
       <h2 className={styles.title}>{building ? building.title : '—'}</h2>
+      {building?.name && building.name !== building.title && (
+        <div className={styles.statRow}>
+          <span className={styles.k}>Building</span>
+          <span className={styles.v}>{building.name}</span>
+        </div>
+      )}
+      {(!building || building.address !== building.title) && (
+        <div className={styles.statRow}>
+          <span className={styles.k}>Address</span>
+          <span className={styles.v}>{building ? building.address : '—'}</span>
+        </div>
+      )}
       <div className={styles.statRow}>
         <span className={styles.k}>Height</span>
         <span className={'mono ' + styles.v}>{building ? building.height : '—'}</span>
