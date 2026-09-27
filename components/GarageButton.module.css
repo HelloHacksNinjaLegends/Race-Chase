@@ -1,0 +1,10 @@
+.cash {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+.divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--panel-border);
+}

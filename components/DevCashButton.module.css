@@ -1,0 +1,13 @@
+.dev {
+  border-style: dashed;
+  font-variant-numeric: tabular-nums;
+}
+.tag {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--warn);
+  color: #fff;
+}

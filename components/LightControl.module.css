@@ -1,0 +1,48 @@
+/* Top center. */
+.control {
+  top: calc(var(--edge) + env(safe-area-inset-top, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  font-size: var(--ui-font-size);
+  white-space: nowrap;
+}
+.option {
+  padding: 6px 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+.option:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+.option:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.selected,
+.selected:hover {
+  background: var(--accent);
+  color: #06231b;
+}
+.current {
+  font-weight: 400;
+  opacity: 0.8;
+}
+.key {
+  margin: 0 6px 0 4px;
+}
+
+@media (max-width: 760px) {
+  .key {
+    display: none;
+  }
+}

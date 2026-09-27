@@ -1,0 +1,9 @@
+.dock {
+  position: absolute;
+  left: var(--edge);
+  bottom: calc(var(--edge) + env(safe-area-inset-bottom, 0px));
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: flex-start;
+  gap: var(--gap);
+}

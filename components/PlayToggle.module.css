@@ -1,0 +1,9 @@
+.active,
+.active:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06231b;
+}
+.active:hover {
+  filter: brightness(1.05);
+}
