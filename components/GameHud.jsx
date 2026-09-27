@@ -24,7 +24,7 @@ export default function GameHud({ speedKmh, altitudeM, onFoot, timeOfDay, prompt
           <>
             <kbd>W</kbd>
             <kbd>S</kbd> pitch · <kbd>A</kbd>
-            <kbd>D</kbd> yaw · <kbd>Space</kbd>/<kbd>Shift</kbd> lift · <kbd>E</kbd> land &amp; exit ·{' '}
+            <kbd>D</kbd> yaw · <kbd>E</kbd>/<kbd>Q</kbd> hold to climb/descend · tap <kbd>E</kbd> to exit ·{' '}
           </>
         ) : (
           <>
@@ -39,7 +39,7 @@ export default function GameHud({ speedKmh, altitudeM, onFoot, timeOfDay, prompt
             )}
           </>
         )}
-        drag: look · scroll: zoom · <kbd>T</kbd> time of day · <kbd>H</kbd> hide HUD · <kbd>Esc</kbd> exit
+        drag/scroll: look around while stopped · <kbd>T</kbd> time of day · <kbd>H</kbd> hide HUD · <kbd>Esc</kbd> exit
       </p>
     </div>
   );

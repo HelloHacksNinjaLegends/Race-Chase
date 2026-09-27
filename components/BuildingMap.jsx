@@ -16,6 +16,7 @@ import GarageButton from './GarageButton';
 import DevCashButton from './DevCashButton';
 import GaragePanel from './GaragePanel';
 import PhonePanel from './PhonePanel';
+import FpsCounter from './FpsCounter';
 import DealershipPanel from './DealershipPanel';
 import DealershipMarker from './DealershipMarker';
 import { useEconomy } from '@/hooks/useEconomy';
@@ -34,6 +35,7 @@ import {
   MAP_ZOOM,
   MAP_PITCH,
   MAP_BEARING,
+  MAX_PIXEL_RATIO,
   MAP_CONFIG,
   STREETS_SOURCE_ID,
   BUILDINGS_LAYER_ID,
@@ -75,6 +77,7 @@ export default function BuildingMap() {
   const [onFoot, setOnFoot] = useState(true);
   const [lotRequest, setLotRequest] = useState(null);
   const [summonRequest, setSummonRequest] = useState(null);
+  const [planeSummonRequest, setPlaneSummonRequest] = useState(null);
   // Where each owned car is in the world ({carId, lng, lat, inUse}), and the
   // player's last position — for the garage list. Seeded from the save.
   const [fleet, setFleet] = useState(initialFleet);
@@ -85,6 +88,18 @@ export default function BuildingMap() {
   }
   // H hides all on-screen UI while driving.
   const [hudHidden, setHudHidden] = useState(false);
+  // P toggles a performance-debugging FPS readout, in any mode.
+  const [fpsVisible, setFpsVisible] = useState(false);
+  useEffect(() => {
+    function handleKeyDown(e) {
+      if (e.code !== 'KeyP' || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+      const el = e.target;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+      setFpsVisible((visible) => !visible);
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   useEffect(() => {
     if (!driveMode) {
@@ -200,7 +215,12 @@ export default function BuildingMap() {
       pitch: MAP_PITCH,
       bearing: MAP_BEARING,
       config: { ...MAP_CONFIG, basemap: { ...MAP_CONFIG.basemap, lightPreset: lightPresetRef.current } },
-      antialias: true
+      antialias: true,
+      // Capped rather than the full window.devicePixelRatio (which is 4x the
+      // pixel count on a typical 2x Retina/high-DPI display) — a meaningful
+      // GPU cost cut on both Mapbox's own tile rendering and our Three.js
+      // layer, which shares this same canvas (see lib/worldLayer.js).
+      pixelRatio: Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO)
     });
     mapRef.current = map;
 
@@ -310,6 +330,12 @@ export default function BuildingMap() {
     setPhoneOpen(false);
   }
 
+  // Phone: summon a plane/jet to the player's current location, from anywhere.
+  function handleSummonPlane(id) {
+    setPlaneSummonRequest({ id });
+    setPhoneOpen(false);
+  }
+
   function handlePose(pose) {
     playerPosRef.current = pose;
     dealership.onPose(pose);
@@ -326,6 +352,8 @@ export default function BuildingMap() {
 
   return (
     <>
+      {fpsVisible && <FpsCounter />}
+
       <div className={styles.mapWrap}>
         <div ref={mapContainerRef} className={styles.map} />
       </div>
@@ -362,6 +390,7 @@ export default function BuildingMap() {
               onFleetChange={setFleet}
               lotRequest={lotRequest}
               summonRequest={summonRequest}
+              planeSummonRequest={planeSummonRequest}
               lightPreset={light.preset}
               paused={dealership.open || garageOpen || phoneOpen}
               hudHidden={hudHidden}
@@ -386,7 +415,12 @@ export default function BuildingMap() {
             />
           )}
           {phoneOpen && (
-            <PhonePanel owned={garage.owned} onSummon={handleSummonCar} onClose={() => setPhoneOpen(false)} />
+            <PhonePanel
+              owned={garage.owned}
+              onSummon={handleSummonCar}
+              onSummonPlane={handleSummonPlane}
+              onClose={() => setPhoneOpen(false)}
+            />
           )}
         </>
       )}

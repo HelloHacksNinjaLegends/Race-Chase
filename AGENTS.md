@@ -36,11 +36,11 @@ first, not to just edit it.
 
 | Module | Files | Owns |
 |---|---|---|
-| Vehicle rig / physics | `lib/vehicle.js`, `lib/vehicleRig.js`, `lib/carModel.js`, `lib/helicopterModel.js`, `lib/helicopterVehicle.js`, `lib/physicsWorld.js`, `components/CarDriving.jsx` | Car/helicopter movement, collision, wheel rig |
+| Vehicle rig / physics | `lib/vehicle.js`, `lib/vehicleRig.js`, `lib/carModel.js`, `lib/svjCarModel.js`, `lib/helicopterModel.js`, `lib/helicopterVehicle.js`, `lib/airplaneModel.js`, `lib/airplaneVehicle.js`, `lib/genericAircraftModel.js`, `lib/jetBridgeModel.js`, `lib/planeCatalog.js`, `lib/airportSpawn.js`, `lib/physicsWorld.js`, `components/CarDriving.jsx` | Car/helicopter/airplane movement, collision, wheel rig |
 | Character controller | `lib/character.js`, `lib/blobCharacterModel.js`, `lib/playerState.js` | On-foot movement, enter/exit vehicle |
 | Camera | `lib/orbitCamera.js` | Shared GTA-style mouse-orbit follow camera (walk/drive/fly) |
 | Dealership & economy | `lib/dealership.js`, `lib/economy.js`, `lib/carCatalog.js`, `components/DealershipMarker.jsx`, `components/DealershipPanel.jsx`, `components/CarList.jsx`, `components/PhonePanel.jsx`, `components/GaragePanel.jsx`, `components/GarageButton.jsx` | Unlocking/spawning vehicles, phone UI |
-| World/environment | `lib/worldLayer.js`, `lib/trees.js`, `lib/treeModel.js`, `lib/buildingCollision.js`, `lib/buildingColors.js`, `lib/buildingPhysics.js`, `lib/mapboxRoads.js`, `lib/mapStyling.js`, `lib/overpass.js`, `lib/roadGraph.js`, `lib/sceneLighting.js`, `lib/lightPreset.js`, `lib/traffic.js`, `lib/worldSave.js`, `components/BuildingMap.jsx`, `components/LightControl.jsx` | Trees, streetlights, buildings, day/night |
+| World/environment | `lib/worldLayer.js`, `lib/buildingCollision.js`, `lib/buildingColors.js`, `lib/buildingPhysics.js`, `lib/mapboxRoads.js`, `lib/mapStyling.js`, `lib/overpass.js`, `lib/roadGraph.js`, `lib/sceneLighting.js`, `lib/lightPreset.js`, `lib/traffic.js`, `lib/worldSave.js`, `components/BuildingMap.jsx`, `components/LightControl.jsx` | Buildings, day/night, NPC traffic (trees/streetlights removed) |
 | UI/HUD | `components/GameHud.jsx`, `components/ControlDock.jsx`, `components/Hint.jsx`, `components/InfoPanel.jsx`, `components/ModalPanel.jsx`, `components/PlayToggle.jsx`, `components/DevCashButton.jsx`, `components/TokenGate.jsx` | HUD, panels, phone overlay |
 
 (Keep this table honest — update it whenever the real file structure changes.)

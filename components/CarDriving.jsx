@@ -33,14 +33,18 @@ import { createCharacter, stepCharacter } from '@/lib/character';
 import { createTraffic } from '@/lib/traffic';
 import { buildRoadGraphFromMap } from '@/lib/mapboxRoads';
 import { createPhysicsWorld } from '@/lib/physicsWorld';
-import { createTrees } from '@/lib/trees';
+import { stepGravity } from '@/lib/gravity';
 import { createBuildingPhysics } from '@/lib/buildingPhysics';
 import { createHelicopter, stepHelicopter, removeHelicopter, teleportHelicopter } from '@/lib/helicopterVehicle';
 import { setHelicopterModel, spinRotors } from '@/lib/helicopterModel';
-import { createStreetlights } from '@/lib/streetlights';
-import { setStreetlightLevel } from '@/lib/streetlightModel';
+import { createAirplane, stepAirplane, removeAirplane, teleportAirplane } from '@/lib/airplaneVehicle';
+import { setAirplaneModel, cancelAirplaneModel } from '@/lib/airplaneModel';
+import { getPlane, PLANES } from '@/lib/planeCatalog';
+import { airportSlot, findTerminalGate } from '@/lib/airportSpawn';
+import { buildJetBridge } from '@/lib/jetBridgeModel';
 import { loadWorld, saveWorld } from '@/lib/worldSave';
 import { createOrbitCamera } from '@/lib/orbitCamera';
+import { freezeRoadWidths, unfreezeRoadWidths } from '@/lib/mapStyling';
 import {
   MAP_PITCH,
   DRIVE_START,
@@ -49,15 +53,14 @@ import {
   WALK_SPEED,
   CHARACTER_RADIUS,
   ENTER_CAR_RANGE_M,
-  CAMERA_MAX_ZOOM,
   ORBIT_MIN_PITCH_DEG,
   ORBIT_MAX_PITCH_DEG,
   ORBIT_YAW_SENSITIVITY,
   ORBIT_PITCH_SENSITIVITY,
-  ORBIT_ZOOM_SENSITIVITY,
   WALK_ORBIT_CAMERA,
   DRIVE_ORBIT_CAMERA,
-  FLY_ORBIT_CAMERA
+  HELICOPTER_ORBIT_CAMERA,
+  AIRPLANE_ORBIT_CAMERA
 } from '@/lib/constants';
 
 const WORLD_LAYER_ID = 'drive-world';
@@ -65,6 +68,10 @@ const INTRO_DURATION_MS = 1200;
 // Cap on per-frame time step, so a backgrounded tab doesn't make things jump.
 const MAX_FRAME_DT = 0.05;
 const SAVE_INTERVAL_MS = 2000;
+// How often to retry snapping a still-parked default plane to the real
+// terminal building (lib/airportSpawn.js's findTerminalGate) — cheap to
+// retry since it stops on its own once every default plane is resolved.
+const GATE_ATTEMPT_INTERVAL_MS = 1000;
 const CONTROLS_HINT_MS = 7000;
 // Before showing "Loading traffic…" (the map-tile fallback usually lands first).
 const TRAFFIC_LOADING_HINT_AFTER_MS = 4000;
@@ -92,8 +99,11 @@ const KEY_BINDINGS = {
   ArrowRight: 'right',
   ShiftLeft: 'run',
   ShiftRight: 'run',
-  Space: 'ascend'
+  KeyQ: 'descend'
 };
+// A quick tap of E (shorter than this) exits a landed helicopter; holding it
+// longer is read as "climb" instead — see handleKey's KeyE case.
+const HELICOPTER_E_TAP_MS = 250;
 
 /**
  * @param {boolean}  props.paused       True while a menu is open: input is ignored and the car brakes.
@@ -103,6 +113,9 @@ const KEY_BINDINGS = {
  *                                         dealership lot (bought, or moved there).
  * @param {{id: string}} props.summonRequest  A new object each time the phone summons an owned
  *                                             car to the player's current location.
+ * @param {{id: string}} props.planeSummonRequest  A new object each time the phone summons a
+ *                                                  plane/jet to the player's current location —
+ *                                                  from anywhere, not just the airport.
  * @param {function} props.onExit       Leave play mode.
  * @param {function} props.onDistance   Called with meters driven, every frame the car moves (not on foot).
  * @param {function} props.onPose       Called with the player's {lng, lat, heading} ~10×/s.
@@ -114,6 +127,7 @@ export default function CarDriving({
   map,
   lotRequest,
   summonRequest,
+  planeSummonRequest,
   paused,
   hudHidden,
   onExit,
@@ -165,27 +179,21 @@ export default function CarDriving({
     const npcs = new Set(); // live NPC traffic, for wheel spin
     const collider = createBuildingCollider(map);
 
-    // --- Physics (trees, and later helicopters): a shared cannon-es world,
-    // anchored at the fixed start point. Car-vs-building/NPC collision stays
-    // on the point-probe system above; see lib/physicsWorld.js for why.
+    // --- Physics (helicopters/planes, and the character/car's gravity): a
+    // shared cannon-es world, anchored at the fixed start point. Car-vs-
+    // building/NPC collision stays on the point-probe system above; see
+    // lib/physicsWorld.js for why.
     const physics = createPhysicsWorld(DRIVE_START[0], DRIVE_START[1]);
     collider.update(DRIVE_START[0], DRIVE_START[1], performance.now());
-    const trees = createTrees({
-      physics,
-      sceneWorld: world,
-      centerLng: DRIVE_START[0],
-      centerLat: DRIVE_START[1],
-      isBlocked: (lng, lat) => collider.contains(lng, lat),
-      repaint
-    });
-    // Building box colliders for the helicopter only (see lib/buildingPhysics.js).
+    // Building box colliders for the helicopter/plane and the gravity system's
+    // ground raycast (see lib/buildingPhysics.js).
     const buildingPhysics = createBuildingPhysics({ physics, collider });
-
-    // --- Streetlights: placed once, as soon as traffic's road graph loads ---
-    let streetlights = null;
 
     // --- Owned cars in the world. Each: { def, state, object, handle } ---
     const vehicles = [];
+    // Static jet-bridge props added once a default plane's gate is found —
+    // see the gate-snap loop in step(), below.
+    const jetBridges = [];
 
     function spawnVehicle(def, lng, lat, heading) {
       const object = new THREE.Group();
@@ -193,6 +201,9 @@ export default function CarDriving({
       if (def.kind === 'helicopter') {
         setHelicopterModel(object, def);
         state = createHelicopter(physics, lng, lat, heading);
+      } else if (def.kind === 'airplane') {
+        setAirplaneModel(object, def);
+        state = createAirplane(physics, lng, lat, heading);
       } else {
         setCarModel(object, def, repaint);
         state = createVehicle(lng, lat, heading);
@@ -206,6 +217,9 @@ export default function CarDriving({
       world.remove(vehicle.handle);
       if (vehicle.def.kind === 'helicopter') {
         removeHelicopter(vehicle.state);
+      } else if (vehicle.def.kind === 'airplane') {
+        removeAirplane(vehicle.state);
+        cancelAirplaneModel(vehicle.object);
       } else {
         cancelCarModel(vehicle.object);
       }
@@ -218,6 +232,8 @@ export default function CarDriving({
     function repositionVehicle(vehicle, lng, lat, heading) {
       if (vehicle.def.kind === 'helicopter') {
         teleportHelicopter(vehicle.state, lng, lat, heading);
+      } else if (vehicle.def.kind === 'airplane') {
+        teleportAirplane(vehicle.state, lng, lat, heading);
       } else {
         Object.assign(vehicle.state, { lng, lat, heading, speed: 0, steer: 0 });
       }
@@ -240,14 +256,36 @@ export default function CarDriving({
     const characterObject = buildBlobCharacter();
     let characterHandle = null;
 
+    // getCar() falls back to the default car for an unrecognized id, so the
+    // plane catalog is checked first — otherwise a saved plane would come
+    // back as a starter hatchback.
+    function getVehicleDef(id) {
+      return getPlane(id) && getPlane(id).id === id ? getPlane(id) : getCar(id);
+    }
+
     for (const p of saved.parked) {
       if (vehicles.some((v) => v.def.id === p.carId)) continue;
-      spawnVehicle(getCar(p.carId), p.lng, p.lat, p.heading);
+      spawnVehicle(getVehicleDef(p.carId), p.lng, p.lat, p.heading);
     }
     if (resume && resume.mode === 'driving' && !vehicles.some((v) => v.def.id === resume.carId)) {
       // Last session ended at the wheel: that car is parked where it stopped.
-      spawnVehicle(getCar(resume.carId), resume.lng, resume.lat, resume.heading);
+      spawnVehicle(getVehicleDef(resume.carId), resume.lng, resume.lat, resume.heading);
     }
+    // The default airplanes are never bought — each one is just always
+    // parked at its own spot on YVR's apron (see lib/airportSpawn.js) until
+    // it's flown somewhere else, in which case the save/restore above
+    // already put it back there. A plane only gets its default apron spot
+    // here the first time it's ever seen; once taken, nothing re-spawns a
+    // replacement — this is a fixed set, not a source you can pull more from.
+    // `pendingGateSnap` marks one for the gate-snap retry loop in step():
+    // once real terminal-building data is available nearby, it gets moved
+    // from this apron fallback to an actual gate against the terminal wall.
+    PLANES.forEach((def, i) => {
+      if (vehicles.some((v) => v.def.id === def.id)) return;
+      const slot = airportSlot(i);
+      const vehicle = spawnVehicle(def, slot.lng, slot.lat, slot.heading);
+      vehicle.pendingGateSnap = true;
+    });
 
     function player() {
       return driven ? driven.state : character;
@@ -309,14 +347,12 @@ export default function CarDriving({
       return (lng, lat) =>
         collider.contains(lng, lat) ||
         traffic.blocks(lng, lat) ||
-        trees.blocksAt(lng, lat) ||
         vehicles.some((v) => v !== self && pointInVehicle(v.state, lng, lat));
     }
     function blocksWalker(lng, lat) {
       return (
         collider.contains(lng, lat) ||
         traffic.blocks(lng, lat) ||
-        trees.blocksAt(lng, lat) ||
         vehicles.some((v) => pointInVehicle(v.state, lng, lat))
       );
     }
@@ -348,8 +384,8 @@ export default function CarDriving({
       let best = null;
       let bestDistance = Infinity;
       for (const v of vehicles) {
-        // Can't board a helicopter mid-flight — only once it's landed.
-        if (v.def.kind === 'helicopter' && v.state.altitude > 1) continue;
+        // Can't board an aircraft mid-flight — only once it's landed.
+        if (v.def.kind !== 'car' && v.state.altitude > 1) continue;
         if (!pointInVehicle(v.state, character.lng, character.lat, ENTER_CAR_RANGE_M)) continue;
         const d = distanceMeters(character.lng, character.lat, v.state.lng, v.state.lat);
         if (d < bestDistance) {
@@ -376,6 +412,9 @@ export default function CarDriving({
         characterHandle = null;
         character.speed = 0;
         driven = ctx.nearestCar.vehicle;
+        // Once taken, stop trying to snap it to a terminal gate — it's the
+        // player's to park wherever they like from here on.
+        driven.pendingGateSnap = false;
       } else if (action.type === 'exitCar') {
         const car = driven.state;
         car.speed = 0;
@@ -427,6 +466,23 @@ export default function CarDriving({
       const spot = summonSpot(character.lng, character.lat, character.heading);
       const existing = vehicles.find((v) => v.def.id === def.id);
       if (existing) {
+        repositionVehicle(existing, spot.lng, spot.lat, spot.heading);
+      } else {
+        spawnVehicle(def, spot.lng, spot.lat, spot.heading);
+      }
+      reportFleet();
+      map.triggerRepaint();
+    }
+
+    // Phone: summon a plane/jet to wherever the player is standing — from
+    // anywhere, not just the airport. Unlike summonCar, this never touches
+    // any other vehicle (planes have no dealership lot to declutter to).
+    function summonPlane(def) {
+      if (state !== ON_FOOT) return;
+      const spot = summonSpot(character.lng, character.lat, character.heading);
+      const existing = vehicles.find((v) => v.def.id === def.id);
+      if (existing) {
+        existing.pendingGateSnap = false; // the player placed it now, not the airport
         repositionVehicle(existing, spot.lng, spot.lat, spot.heading);
       } else {
         spawnVehicle(def, spot.lng, spot.lat, spot.heading);
@@ -492,21 +548,27 @@ export default function CarDriving({
       const lighting = SCENE_LIGHTING[preset] || SCENE_LIGHTING.day;
       world.setLighting(lighting);
       setLampLevel(lighting.lamps);
-      setStreetlightLevel(lighting.lamps);
     }
 
-    sessionRef.current = { deliverToLot, setLighting, summonCar };
+    sessionRef.current = { deliverToLot, setLighting, summonCar, summonPlane };
 
     // --- Keyboard input ---
-    const pressed = { up: false, down: false, left: false, right: false, run: false, ascend: false };
+    const pressed = { up: false, down: false, left: false, right: false, run: false, ascend: false, descend: false };
+    let eKeyDownAt = 0;
 
-    // 'walk' | 'drive' | 'fly' — which orbit-camera config applies right now.
+    // 'walk' | 'drive' | 'helicopter' | 'airplane' — which orbit-camera config applies right now.
     function playerMode() {
       if (!driven) return 'walk';
-      return driven.def.kind === 'helicopter' ? 'fly' : 'drive';
+      return driven.def.kind === 'car' ? 'drive' : driven.def.kind;
     }
+    const ORBIT_CAMERA_BY_MODE = {
+      walk: WALK_ORBIT_CAMERA,
+      drive: DRIVE_ORBIT_CAMERA,
+      helicopter: HELICOPTER_ORBIT_CAMERA,
+      airplane: AIRPLANE_ORBIT_CAMERA
+    };
     function configFor(mode) {
-      return mode === 'walk' ? WALK_ORBIT_CAMERA : mode === 'fly' ? FLY_ORBIT_CAMERA : DRIVE_ORBIT_CAMERA;
+      return ORBIT_CAMERA_BY_MODE[mode];
     }
 
     // On foot, WASD is relative to the camera (GTA-style): "up" walks away
@@ -547,9 +609,27 @@ export default function CarDriving({
         onExitRef.current();
         return;
       }
-      if (isDown && e.code === 'KeyE') {
+      if (e.code === 'KeyE') {
         e.preventDefault();
-        if (e.repeat || pausedRef.current) return;
+        const flying = driven && driven.def.kind !== 'car';
+        if (flying) {
+          // Held: climb. A quick tap (released before it could mean "climb")
+          // still gets out, same as E always has for cars.
+          if (e.repeat) return;
+          if (isDown) {
+            eKeyDownAt = performance.now();
+            pressed.ascend = true;
+          } else {
+            pressed.ascend = false;
+            if (!pausedRef.current && performance.now() - eKeyDownAt < HELICOPTER_E_TAP_MS) {
+              const ctx = interactContext();
+              applyInteract(ctx, resolveInteract(ctx));
+              lastHudUpdate = 0;
+            }
+          }
+          return;
+        }
+        if (!isDown || e.repeat || pausedRef.current) return;
         const ctx = interactContext();
         applyInteract(ctx, resolveInteract(ctx));
         lastHudUpdate = 0; // reflect the new state in the HUD right away
@@ -569,46 +649,37 @@ export default function CarDriving({
     window.addEventListener('keyup', handleKey);
     window.addEventListener('blur', releaseAll);
 
-    // --- Mouse: drag to orbit the camera, scroll to zoom (no auto-snap-back) ---
+    // --- On-foot mouse-look: click-and-drag, cursor stays visible on screen
+    // the whole time (no pointer lock). In a vehicle this is ignored — see
+    // camera.update()'s isInVehicle. ---
+    const canvas = map.getCanvas();
     let dragging = false;
-    let lastX = 0;
-    let lastY = 0;
     function handlePointerDown(e) {
       if (pausedRef.current || e.button !== 0) return;
       dragging = true;
-      lastX = e.clientX;
-      lastY = e.clientY;
-    }
-    function handlePointerMove(e) {
-      if (!dragging) return;
-      camera.orbit(e.clientX - lastX, e.clientY - lastY, ORBIT_YAW_SENSITIVITY, ORBIT_PITCH_SENSITIVITY);
-      lastX = e.clientX;
-      lastY = e.clientY;
     }
     function handlePointerUp() {
       dragging = false;
     }
-    function handleWheel(e) {
-      if (pausedRef.current) return;
-      e.preventDefault();
-      camera.zoom(e.deltaY, ORBIT_ZOOM_SENSITIVITY);
+    function handlePointerMove(e) {
+      if (!dragging) return;
+      camera.orbit(e.movementX, e.movementY, ORBIT_YAW_SENSITIVITY, ORBIT_PITCH_SENSITIVITY);
     }
-    const canvas = map.getCanvas();
     canvas.addEventListener('pointerdown', handlePointerDown);
-    window.addEventListener('pointermove', handlePointerMove);
     window.addEventListener('pointerup', handlePointerUp);
-    canvas.addEventListener('wheel', handleWheel, { passive: false });
+    window.addEventListener('pointermove', handlePointerMove);
 
     // --- Take over the camera ---
     const disabledHandlers = USER_HANDLERS.filter((name) => map[name] && map[name].isEnabled());
     disabledHandlers.forEach((name) => map[name].disable());
-    // The orbit camera can zoom in past Mapbox's default zoom limit of 22.
-    const previousMaxZoom = map.getMaxZoom();
-    activeSessions++;
-    map.setMaxZoom(CAMERA_MAX_ZOOM);
 
     map.addLayer(world.layer);
     setLighting(lightPresetRef.current);
+    // Freeze road widths so they don't visibly thin/thicken as the orbit
+    // camera fakes distance by changing the map's real zoom (see
+    // lib/mapStyling.js) — 16.5 matches the street-level zoom this same
+    // session eases back out to on exit, below.
+    const frozenRoadWidths = freezeRoadWidths(map, 16.5);
 
     // Ease from wherever the user was into the follow view before handing
     // control to the per-frame camera.
@@ -624,6 +695,7 @@ export default function CarDriving({
     let blockedUntil = 0;
     let lastHud = null;
     let lastSave = performance.now();
+    let lastGateAttempt = 0;
     const trafficStartedAt = performance.now();
 
     function step(now) {
@@ -645,9 +717,13 @@ export default function CarDriving({
 
       let result;
       if (driven && driven.def.kind === 'helicopter') {
-        const lift = isPaused ? 0 : (pressed.ascend ? 1 : 0) - (pressed.run ? 1 : 0);
+        const lift = isPaused ? 0 : (pressed.ascend ? 1 : 0) - (pressed.descend ? 1 : 0);
         result = stepHelicopter(driven.state, { throttle: forward, steer: turn, lift }, driven.def, dt);
         spinRotors(driven.object, dt);
+        if (result.distance > 0 && onDistanceRef.current) onDistanceRef.current(result.distance);
+      } else if (driven && driven.def.kind === 'airplane') {
+        const lift = isPaused ? 0 : (pressed.ascend ? 1 : 0) - (pressed.descend ? 1 : 0);
+        result = stepAirplane(driven.state, { throttle: forward, steer: turn, lift }, driven.def, dt);
         if (result.distance > 0 && onDistanceRef.current) onDistanceRef.current(result.distance);
       } else if (driven) {
         result = stepVehicle(driven.state, { throttle: forward, steer: turn, brake: isPaused }, driven.def, dt, blocksCar(driven));
@@ -655,7 +731,6 @@ export default function CarDriving({
           spinWheels(driven.object, Math.sign(driven.state.speed) * result.distance);
           if (onDistanceRef.current) onDistanceRef.current(result.distance);
         }
-        trees.checkImpact(driven.state.lng, driven.state.lat, driven.state.heading, driven.state.speed);
       } else {
         const moveHeading = isPaused ? null : moveHeadingFromCamera();
         result = stepCharacter(
@@ -670,12 +745,16 @@ export default function CarDriving({
 
       buildingPhysics.sync();
       physics.step(dt);
-      trees.sync();
+
+      // Real gravity for whichever of the character/car is active — falls
+      // when unsupported, lands on the ground or a building's rooftop (see
+      // lib/gravity.js). The helicopter/plane/private jet manage their own
+      // altitude instead (E/Q, gravity canceled) and are skipped here.
+      if (!driven || driven.def.kind === 'car') stepGravity(me, physics, dt);
 
       updateView();
       traffic.update(dt, me, now, blocksTraffic);
       for (const npc of npcs) spinWheels(npc.object, npc.moved);
-      if (!streetlights && traffic.graph) streetlights = createStreetlights(world, traffic.graph);
 
       if (now - lastSave > SAVE_INTERVAL_MS) {
         lastSave = now;
@@ -683,12 +762,31 @@ export default function CarDriving({
         reportFleet();
       }
 
+      if (now - lastGateAttempt > GATE_ATTEMPT_INTERVAL_MS) {
+        lastGateAttempt = now;
+        const pendingPlanes = vehicles.filter((v) => v.def.kind === 'airplane' && v.pendingGateSnap);
+        for (const v of pendingPlanes) {
+          const gate = findTerminalGate(map, v.state.lng, v.state.lat);
+          if (!gate) continue;
+          v.pendingGateSnap = false;
+          repositionVehicle(v, gate.lng, gate.lat, gate.heading);
+          const bridge = buildJetBridge(gate.bridgeLength);
+          jetBridges.push(
+            world.add(bridge, { lng: gate.bridgeWallLng, lat: gate.bridgeWallLat, heading: gate.bridgeHeading, altitude: 0 })
+          );
+        }
+        if (pendingPlanes.length) map.triggerRepaint();
+      }
+
       const mode = playerMode();
       if (mode !== cameraMode) {
         cameraMode = mode;
         camera.setConfig(configFor(mode));
       }
-      camera.update(me);
+      camera.update(me, mode !== 'walk');
+      // A menu opening mid-drag shouldn't leave the camera still orbiting
+      // once the mouse moves over the menu's own UI.
+      if (isPaused) dragging = false;
       map.triggerRepaint();
 
       // HUD + pose reports are throttled so React isn't re-rendering at 60 fps.
@@ -697,7 +795,7 @@ export default function CarDriving({
         if (onPoseRef.current) onPoseRef.current({ lng: me.lng, lat: me.lat, heading: me.heading });
         const next = {
           speedKmh: Math.round(Math.abs(me.speed) * 3.6),
-          altitudeM: driven && driven.def.kind === 'helicopter' ? Math.round(me.altitude) : null,
+          altitudeM: driven && driven.def.kind !== 'car' ? Math.round(me.altitude) : null,
           blocked: now < blockedUntil,
           onFoot: state === ON_FOOT,
           interact: interactPrompt(interactContext()),
@@ -721,32 +819,28 @@ export default function CarDriving({
       window.removeEventListener('keyup', handleKey);
       window.removeEventListener('blur', releaseAll);
       canvas.removeEventListener('pointerdown', handlePointerDown);
-      window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerUp);
-      canvas.removeEventListener('wheel', handleWheel);
+      window.removeEventListener('pointermove', handlePointerMove);
 
       const me = player();
       // The map may already be gone if BuildingMap is tearing it down too.
       try {
         if (map.getLayer(WORLD_LAYER_ID)) map.removeLayer(WORLD_LAYER_ID);
+        unfreezeRoadWidths(map, frozenRoadWidths);
         disabledHandlers.forEach((name) => map[name].enable());
         map.easeTo({ center: [me.lng, me.lat], zoom: 16.5, pitch: MAP_PITCH, bearing: me.heading, duration: 900 });
-        // Put the zoom limit back once the camera has pulled out (unless a new
-        // drive session has started in the meantime).
-        activeSessions--;
-        map.once('moveend', () => {
-          if (activeSessions === 0) map.setMaxZoom(previousMaxZoom);
-        });
       } catch (e) {
         // map already removed — nothing to restore
       }
       vehicles.slice().forEach(despawnVehicle);
+      jetBridges.forEach((handle) => {
+        world.remove(handle);
+        disposeObject(handle.object);
+      });
       traffic.dispose();
       collider.dispose();
-      trees.dispose();
       buildingPhysics.dispose();
       physics.dispose();
-      if (streetlights) streetlights.dispose();
       disposeObject(characterObject);
     };
   }, [map]);
@@ -764,6 +858,12 @@ export default function CarDriving({
   useEffect(() => {
     if (summonRequest && sessionRef.current) sessionRef.current.summonCar(getCar(summonRequest.id));
   }, [summonRequest]);
+
+  // The phone: summon a plane/jet to wherever the player is standing —
+  // works from anywhere, not just the airport.
+  useEffect(() => {
+    if (planeSummonRequest && sessionRef.current) sessionRef.current.summonPlane(getPlane(planeSummonRequest.id));
+  }, [planeSummonRequest]);
 
   const onModeChangeRef = useRef(onModeChange);
   onModeChangeRef.current = onModeChange;
@@ -794,9 +894,6 @@ export default function CarDriving({
     />
   );
 }
-
-// Drive sessions currently mounted; the zoom limit is only restored when none are.
-let activeSessions = 0;
 
 function isTypingTarget(el) {
   return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
