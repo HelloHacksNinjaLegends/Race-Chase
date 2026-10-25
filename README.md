@@ -5,6 +5,10 @@ built on the Mapbox Standard style: colorful clickable buildings, dawn/day/
 dusk/night lighting, a car dealership economy, and third-person, driver's-
 seat, or cockpit views.
 
+# Links
+[Driving with routes](https://raceroute.vercel.app/)
+[Open world driving and flying](https://racechase.vercel.app/)
+
 ## Project structure
 
 ```
